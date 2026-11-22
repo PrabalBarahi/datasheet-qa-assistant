@@ -27,7 +27,14 @@ def build_index(file_bytes: bytes, name: str) -> Index:
     pages = load_pdf_pages(io.BytesIO(file_bytes))
     if not pages:
         raise ValueError("No text found. Scanned PDFs need OCR, which is not supported.")
-    return Index(chunk_pages(pages), pages)
+    # Use meaning-based search too when sentence-transformers is installed.
+    # On small free hosts it is left out and keyword search alone is used.
+    try:
+        import sentence_transformers  # noqa: F401
+        use_embeddings = True
+    except ImportError:
+        use_embeddings = False
+    return Index(chunk_pages(pages), pages, use_embeddings=use_embeddings)
 
 
 uploaded = st.file_uploader("Datasheet PDF", type="pdf")
@@ -39,7 +46,8 @@ if uploaded:
         st.error(str(err))
         st.stop()
 
-    st.success(f"Indexed {len(index.chunks)} text chunks from {uploaded.name}")
+    mode = "keyword + meaning search" if index.model is not None else "keyword search only"
+    st.success(f"Indexed {len(index.chunks)} text chunks from {uploaded.name} ({mode})")
     question = st.text_input("Ask a question", placeholder="What is the maximum supply voltage?")
 
     if question:

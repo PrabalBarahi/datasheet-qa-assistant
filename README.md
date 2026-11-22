@@ -22,7 +22,7 @@ Question -> hybrid search (embeddings + BM25-style keywords, fused by rank)
 ```bash
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+pip install -r requirements-full.txt   # full local version; requirements.txt alone gives keyword-only search (used for free hosting)
 streamlit run app.py
 ```
 Enter your API key in the sidebar (never commit keys).
@@ -38,7 +38,7 @@ package and pin facts, and questions the document cannot answer (price, slew rat
 | Version | Score | Notes |
 |---------|-------|-------|
 | v1 (word chunks, 4 excerpts) | 8/11 correct (manual) | Mixed up table columns; missed a table row; read a graph axis as a value |
-| v2 (this version) | not yet measured | Layout-aware tables, hybrid search, whole pages, column-aware prompt |
+| v2 (this version) | _fill in after running_ | Layout-aware tables, hybrid search, whole pages, column-aware prompt |
 
 ## What I learned
 - Flattened PDF tables lose column structure, so the model read the LM258 *max* value for the LM358 *typical* one.
