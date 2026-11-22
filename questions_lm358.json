@@ -1,0 +1,18 @@
+[
+  {"question": "What is the maximum supply voltage?", "expect_any": ["32"]},
+  {"question": "What is the typical input offset voltage of the LM358?", "expect_any": ["2.0 mV", "2 mV"], "reject": ["5.0 mV is"]},
+  {"question": "What is the typical supply current at VCC = 5 V?", "expect_any": ["0.7"]},
+  {"question": "What is the operating temperature range of the LM358?", "expect_any": ["0 to +70", "0 to 70", "0 °C to +70", "0°C to +70"]},
+  {"question": "What is the junction-to-ambient thermal resistance of the SOIC-8 package?", "expect_any": ["212"]},
+  {"question": "What is the input common-mode voltage range at VCC = 30 V?", "expect_any": ["28.3"]},
+  {"question": "What is the output short-circuit current?", "expect_any": ["40 mA"]},
+  {"question": "What is the typical input bias current of the LM358?", "expect_any": ["-45", "−45", "45 nA"]},
+  {"question": "What packages is it available in?", "expect_any": ["Micro8"]},
+  {"question": "What is the typical open-loop voltage gain?", "expect_any": ["100 V/mV"], "reject": ["18 dB"]},
+  {"question": "What is the typical output source current, and sink current?", "expect_any": ["40 mA"]},
+  {"question": "What is the thermal resistance of the Micro8 package?", "expect_any": ["238"]},
+  {"question": "What is the price of the LM358?", "expect_any": ["could not find"]},
+  {"question": "What is the slew rate?", "expect_any": ["could not find"]},
+  {"question": "What is the gain bandwidth product?", "expect_any": ["could not find"]},
+  {"question": "What is the maximum operating frequency of the internal ADC?", "expect_any": ["could not find"]}
+]

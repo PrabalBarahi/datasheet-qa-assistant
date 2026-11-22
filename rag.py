@@ -1,38 +1,59 @@
 """
-rag.py - the core logic of the Datasheet Q&A Assistant.
+rag.py (version 2) - core logic of the Datasheet Q&A Assistant.
 
-RAG = Retrieval-Augmented Generation. The idea in 4 steps:
-  1. Read the PDF and split it into small chunks of text.
-  2. Turn every chunk into an "embedding" (a list of numbers that captures meaning).
-  3. When the user asks a question, embed the question too and find the chunks
-     whose embeddings are most similar (retrieval).
-  4. Send ONLY those chunks plus the question to an LLM, and tell it to answer
-     from them (generation). This reduces made-up answers (hallucinations).
+What changed from version 1, and why (each change came from a failed test):
+  1. Pages are read in "layout" mode and tables are written with " | " between
+     columns, so the column headers (LM258 | LM358 | LM358A, Min | Typ | Max)
+     stay lined up with the numbers. Fixes: model took the LM258 max value
+     (5.0 mV) for the LM358 typical value (2.0 mV).
+  2. Search is "hybrid": meaning-based (embeddings) + exact-word (keyword)
+     scores are combined. Fixes: table rows that the embedding search missed.
+  3. The model receives whole pages (the top few pages found), not tiny
+     fragments, so a table row is always seen together with its header.
+  4. The prompt tells the model how to read tables and to name the column.
 """
 
+import math
 import os
+import re
+from collections import Counter
 
 
-# ---------- Step 1: read the PDF and split into chunks ----------
+# ---------- Step 1: read the PDF ----------
+
+def _clean_layout_text(text: str) -> str:
+    """Turn wide layout text into compact rows with ' | ' between columns."""
+    text = re.sub(r"Ty\s+p", "Typ", text)          # PDF splits 'Typ' into 'Ty p'
+    text = re.sub(r"/C\d{4}", "", text)            # drop unreadable symbol codes like /C0087
+    lines = []
+    for line in text.splitlines():
+        line = line.rstrip()
+        if not line.strip():
+            continue
+        line = re.sub(r"\s{3,}", " | ", line.strip())  # 3+ spaces = column break
+        lines.append(line)
+    return "\n".join(lines)
+
 
 def load_pdf_pages(file) -> list[tuple[int, str]]:
-    """Return a list of (page_number, text) for every page in the PDF.
-    `file` can be a path or a file-like object (e.g. a Streamlit upload)."""
-    from pypdf import PdfReader  # imported here so other functions work without it
+    """Return [(page_number, text)] for every page that has text."""
+    from pypdf import PdfReader
 
     reader = PdfReader(file)
     pages = []
     for number, page in enumerate(reader.pages, start=1):
-        text = page.extract_text() or ""
+        try:
+            raw = page.extract_text(extraction_mode="layout") or ""
+        except Exception:
+            raw = page.extract_text() or ""
+        text = _clean_layout_text(raw)
         if text.strip():
             pages.append((number, text))
     return pages
 
 
-def chunk_pages(pages, words_per_chunk: int = 180, overlap: int = 40) -> list[dict]:
-    """Split each page into overlapping chunks of roughly `words_per_chunk` words.
-    Overlap keeps a sentence that falls on a boundary from being cut in half.
-    Each chunk remembers its page number so we can cite it later."""
+def chunk_pages(pages, words_per_chunk: int = 150, overlap: int = 30) -> list[dict]:
+    """Split pages into overlapping chunks of about `words_per_chunk` words."""
     if overlap >= words_per_chunk:
         raise ValueError("overlap must be smaller than words_per_chunk")
 
@@ -50,57 +71,139 @@ def chunk_pages(pages, words_per_chunk: int = 180, overlap: int = 40) -> list[di
     return chunks
 
 
-# ---------- Steps 2 and 3: embeddings and search ----------
+# ---------- Step 2: keyword scoring (no extra libraries) ----------
+
+STOPWORDS = {
+    "the", "a", "an", "is", "are", "of", "what", "which", "for", "to", "in", "on",
+    "and", "or", "does", "do", "how", "at", "it", "its", "this", "that", "with",
+    "typical", "maximum", "minimum", "value",
+}
+
+
+def tokenize(text: str) -> list[str]:
+    return [w for w in re.findall(r"[a-z0-9]+", text.lower()) if w not in STOPWORDS]
+
+
+class KeywordIndex:
+    """A small BM25-style scorer: rewards chunks containing the rare words of the question."""
+
+    def __init__(self, texts: list[str], k1: float = 1.5, b: float = 0.75):
+        self.k1, self.b = k1, b
+        self.docs = [Counter(tokenize(t)) for t in texts]
+        self.lengths = [sum(d.values()) for d in self.docs]
+        self.avg_len = (sum(self.lengths) / len(self.lengths)) if self.lengths else 1
+        df = Counter()
+        for d in self.docs:
+            df.update(d.keys())
+        n = len(self.docs)
+        self.idf = {w: math.log(1 + (n - c + 0.5) / (c + 0.5)) for w, c in df.items()}
+
+    def scores(self, question: str) -> list[float]:
+        terms = tokenize(question)
+        out = []
+        for doc, length in zip(self.docs, self.lengths):
+            s = 0.0
+            for t in terms:
+                f = doc.get(t, 0)
+                if f:
+                    norm = f + self.k1 * (1 - self.b + self.b * length / self.avg_len)
+                    s += self.idf.get(t, 0) * f * (self.k1 + 1) / norm
+            out.append(s)
+        return out
+
+
+def rank_positions(scores) -> dict[int, int]:
+    """Map chunk index -> rank (0 = best)."""
+    order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+    return {i: r for r, i in enumerate(order)}
+
+
+# ---------- Step 3: hybrid search ----------
 
 class Index:
-    """Holds all chunks and their embeddings, and can search them."""
+    """Holds chunks, embeddings and keyword statistics; can search both."""
 
-    MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"  # small, free, runs on CPU
+    MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
-    def __init__(self, chunks: list[dict]):
+    def __init__(self, chunks: list[dict], pages: list[tuple[int, str]], use_embeddings=True):
         import numpy as np
-        from sentence_transformers import SentenceTransformer
 
         self.np = np
         self.chunks = chunks
-        self.model = SentenceTransformer(self.MODEL_NAME)
-        # normalize_embeddings=True makes cosine similarity a simple dot product
-        self.vectors = self.model.encode(
-            [c["text"] for c in chunks], normalize_embeddings=True
-        )
+        self.page_text = dict(pages)
+        self.keywords = KeywordIndex([c["text"] for c in chunks])
+        self.model = None
+        self.vectors = None
+        if use_embeddings:
+            from sentence_transformers import SentenceTransformer
 
-    def search(self, question: str, top_k: int = 4) -> list[dict]:
-        """Return the top_k chunks most similar to the question."""
-        q = self.model.encode([question], normalize_embeddings=True)[0]
-        scores = self.vectors @ q                      # similarity of q to every chunk
-        best = self.np.argsort(scores)[::-1][:top_k]   # indices of highest scores
-        return [{**self.chunks[i], "score": float(scores[i])} for i in best]
+            self.model = SentenceTransformer(self.MODEL_NAME)
+            self.vectors = self.model.encode(
+                [c["text"] for c in chunks], normalize_embeddings=True
+            )
+
+    def search(self, question: str, top_k: int = 6) -> list[dict]:
+        """Return top_k chunks using reciprocal rank fusion of both searches."""
+        kw_scores = self.keywords.scores(question)
+        kw_rank = rank_positions(kw_scores)
+        if self.model is not None:
+            q = self.model.encode([question], normalize_embeddings=True)[0]
+            em_scores = (self.vectors @ q).tolist()
+            em_rank = rank_positions(em_scores)
+        else:
+            em_scores, em_rank = [0.0] * len(self.chunks), {}
+
+        fused = []
+        for i in range(len(self.chunks)):
+            score = 1 / (60 + kw_rank[i])
+            if em_rank:
+                score += 1 / (60 + em_rank[i])
+            fused.append((score, i))
+        fused.sort(reverse=True)
+        return [
+            {**self.chunks[i], "score": s, "similarity": em_scores[i], "keyword": kw_scores[i]}
+            for s, i in fused[:top_k]
+        ]
+
+    def pages_for(self, hits: list[dict], max_pages: int = 3) -> list[tuple[int, str]]:
+        """Whole pages of the best hits (in order of relevance), so tables keep their headers."""
+        seen = []
+        for h in hits:
+            if h["page"] not in seen:
+                seen.append(h["page"])
+            if len(seen) == max_pages:
+                break
+        return [(p, self.page_text[p]) for p in seen]
 
 
 # ---------- Step 4: ask the LLM ----------
 
 SYSTEM_PROMPT = (
-    "You are an assistant that answers questions about an electronics datasheet. "
-    "Use ONLY the provided excerpts. If the answer is not in the excerpts, say "
-    "'I could not find that in the document.' Always mention the page number(s) "
-    "you used, like (p. 5). Keep units and values exactly as written."
+    "You answer questions about an electronics datasheet using ONLY the pages provided. "
+    "If the answer is not in them, say 'I could not find that in the document.' "
+    "Never use numbers from graphs' axis labels.\n"
+    "How to read the tables: columns are separated by ' | ' and go left to right. "
+    "A datasheet often has several device variants side by side (for example LM258, LM358, "
+    "LM358A), and each variant has its own Min, Typ and Max columns, in that order. Count "
+    "the columns carefully, use the header row to find the right variant and the right "
+    "Min/Typ/Max column, and never mix variants or take a Max value when Typ was asked. "
+    "'-' means no value is given.\n"
+    "Answer in one or two short sentences. State the value with its unit, the variant "
+    "and the condition if relevant, and the page number like (p. 4)."
 )
 
 
-def build_messages(question: str, hits: list[dict]) -> list[dict]:
-    context = "\n\n".join(f"[Page {h['page']}]\n{h['text']}" for h in hits)
-    user = f"Excerpts:\n{context}\n\nQuestion: {question}"
+def build_messages(question: str, pages: list[tuple[int, str]]) -> list[dict]:
+    context = "\n\n".join(f"=== PAGE {n} ===\n{t}" for n, t in pages)
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user},
+        {"role": "user", "content": f"Datasheet pages:\n{context}\n\nQuestion: {question}"},
     ]
 
 
 def ask_llm(messages, api_key=None, base_url=None, model=None) -> str:
-    """Call any OpenAI-compatible chat API (Groq, Google Gemini, OpenRouter, OpenAI...).
-    Settings come from arguments or from environment variables:
-      LLM_API_KEY, LLM_BASE_URL, LLM_MODEL
-    """
+    """Call any OpenAI-compatible chat API. Settings may also come from the
+    environment variables LLM_API_KEY, LLM_BASE_URL and LLM_MODEL."""
     from openai import OpenAI
 
     api_key = api_key or os.getenv("LLM_API_KEY")
@@ -111,6 +214,12 @@ def ask_llm(messages, api_key=None, base_url=None, model=None) -> str:
 
     client = OpenAI(api_key=api_key, base_url=base_url)
     response = client.chat.completions.create(
-        model=model, messages=messages, temperature=0.1
+        model=model, messages=messages, temperature=0
     )
-    return response.choices[0].message.content
+    answer = (response.choices[0].message.content or "").strip()
+    if not answer:  # some reasoning models sometimes return an empty message
+        response = client.chat.completions.create(
+            model=model, messages=messages, temperature=0
+        )
+        answer = (response.choices[0].message.content or "").strip()
+    return answer or "(The model returned an empty answer. Please ask again.)"
