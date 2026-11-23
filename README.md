@@ -38,7 +38,7 @@ package and pin facts, and questions the document cannot answer (price, slew rat
 | Version | Score | Notes |
 |---------|-------|-------|
 | v1 (word chunks, 4 excerpts) | 8/11 correct (manual) | Mixed up table columns; missed a table row; read a graph axis as a value |
-| v2 (this version) | _fill in after running_ | Layout-aware tables, hybrid search, whole pages, column-aware prompt |
+| v2 (this version) | not yet confirmed | Layout-aware tables, hybrid search, whole pages, column-aware prompt |
 
 ## What I learned
 - Flattened PDF tables lose column structure, so the model read the LM258 *max* value for the LM358 *typical* one.
